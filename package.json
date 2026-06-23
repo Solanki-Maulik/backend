@@ -16,6 +16,7 @@
     "mongodb": "^7.3.0",
     "mongoose": "^7.5.0",
     "qrcode": "^1.5.3",
+    "razorpay": "^2.9.4",
     "socket.io": "^4.7.2"
   },
   "devDependencies": {
