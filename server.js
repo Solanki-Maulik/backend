@@ -88,6 +88,7 @@ const OrderSchema = new mongoose.Schema({
   }],
   total: { type: Number, required: true },
   status: { type: String, enum: ['pending', 'done'], default: 'pending' },
+  paymentMethod: { type: String, enum: ['online', 'cash'], default: 'online' },
   paymentStatus: { type: String, enum: ['unpaid', 'paid', 'failed'], default: 'unpaid' },
   razorpayOrderId: { type: String, default: '' },
   razorpayPaymentId: { type: String, default: '' },
@@ -101,6 +102,7 @@ const InvoiceSchema = new mongoose.Schema({
   customerName: { type: String, default: '' },
   customerPhone: { type: String, default: '' },
   tableNumber: { type: String, required: true },
+  paymentMethod: { type: String, enum: ['online', 'cash'], default: 'online' },
   items: [{
     name: String,
     price: Number,
@@ -544,7 +546,7 @@ app.post('/api/order', async (req, res) => {
   try {
     const {
       restaurantId, tableCode, tableNumber, customerName, customerPhone, items,
-      razorpayOrderId, razorpayPaymentId, razorpaySignature
+      paymentMethod, razorpayOrderId, razorpayPaymentId, razorpaySignature
     } = req.body;
 
     if (!restaurantId || !tableNumber || !items || !items.length) {
@@ -560,21 +562,28 @@ app.post('/api/order', async (req, res) => {
       return res.status(403).json({ error: 'Ordering is not enabled for this restaurant yet.' });
     }
 
-    // Verify Razorpay payment signature to confirm payment actually happened
+    // Two payment paths: 'cash' (pay at counter, trusted, flagged for staff to collect)
+    // or 'online' (Razorpay — verified via signature before the order is accepted)
     let paymentStatus = 'unpaid';
-    if (razorpayOrderId && razorpayPaymentId && razorpaySignature) {
-      const expectedSignature = crypto
-        .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || 'placeholder_secret')
-        .update(`${razorpayOrderId}|${razorpayPaymentId}`)
-        .digest('hex');
+    const method = paymentMethod === 'cash' ? 'cash' : 'online';
 
-      if (expectedSignature === razorpaySignature) {
-        paymentStatus = 'paid';
-      } else {
-        return res.status(400).json({ error: 'Payment verification failed. Please try again.' });
-      }
+    if (method === 'cash') {
+      paymentStatus = 'unpaid'; // stays unpaid until owner marks it collected in admin/kitchen
     } else {
-      return res.status(400).json({ error: 'Payment information missing. Please complete payment first.' });
+      if (razorpayOrderId && razorpayPaymentId && razorpaySignature) {
+        const expectedSignature = crypto
+          .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || 'placeholder_secret')
+          .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+          .digest('hex');
+
+        if (expectedSignature === razorpaySignature) {
+          paymentStatus = 'paid';
+        } else {
+          return res.status(400).json({ error: 'Payment verification failed. Please try again.' });
+        }
+      } else {
+        return res.status(400).json({ error: 'Payment information missing. Please complete payment first.' });
+      }
     }
 
     const total = items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
@@ -587,6 +596,7 @@ app.post('/api/order', async (req, res) => {
       customerPhone,
       items,
       total: parseFloat(total.toFixed(2)),
+      paymentMethod: method,
       paymentStatus,
       razorpayOrderId: razorpayOrderId || '',
       razorpayPaymentId: razorpayPaymentId || ''
@@ -600,6 +610,7 @@ app.post('/api/order', async (req, res) => {
       customerName,
       customerPhone,
       tableNumber,
+      paymentMethod: method,
       items: items.map(i => ({
         name: i.name,
         price: i.price,
@@ -617,6 +628,7 @@ app.post('/api/order', async (req, res) => {
       items: order.items,
       total: order.total,
       status: order.status,
+      paymentMethod: order.paymentMethod,
       paymentStatus: order.paymentStatus,
       createdAt: order.createdAt
     });
@@ -660,6 +672,28 @@ app.put('/api/admin/orders/:id', authMiddleware, async (req, res) => {
     res.json(order);
   } catch (err) {
     res.status(500).json({ error: 'Server error updating order' });
+  }
+});
+
+// Mark a cash order as collected — staff confirms they received the money
+app.put('/api/admin/orders/:id/mark-paid', authMiddleware, async (req, res) => {
+  try {
+    const order = await Order.findOneAndUpdate(
+      { _id: req.params.id, restaurantId: req.restaurantId },
+      { $set: { paymentStatus: 'paid' } },
+      { new: true }
+    );
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    io.to(`kitchen_${req.restaurantId}`).emit('order_updated', {
+      _id: order._id,
+      status: order.status,
+      paymentStatus: order.paymentStatus
+    });
+
+    res.json(order);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error updating payment status' });
   }
 });
 
